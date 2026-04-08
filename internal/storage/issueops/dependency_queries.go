@@ -111,6 +111,57 @@ func GetDependencyCountsInTx(ctx context.Context, tx *sql.Tx, issueIDs []string)
 		result[id] = &types.DependencyCounts{}
 	}
 
+	// Partition wisp vs permanent IDs.
+	var wispIDs, permIDs []string
+	for _, id := range issueIDs {
+		if IsActiveWispInTx(ctx, tx, id) {
+			wispIDs = append(wispIDs, id)
+		} else {
+			permIDs = append(permIDs, id)
+		}
+	}
+
+	// Query each partition against its correct table.
+	for _, pair := range []struct {
+		table string
+		ids   []string
+	}{
+		{"wisp_dependencies", wispIDs},
+		{"dependencies", permIDs},
+	} {
+		if len(pair.ids) == 0 {
+			continue
+		}
+		if err := countDepsInTable(ctx, tx, pair.table, pair.ids, result); err != nil {
+			return nil, err
+		}
+	}
+
+	// Permanent IDs may also appear as depends_on_id in wisp_dependencies
+	// (a wisp depends on them). Count those additional dependents.
+	if len(permIDs) > 0 {
+		if err := countDependentsInTable(ctx, tx, "wisp_dependencies", permIDs, result); err != nil {
+			return nil, err
+		}
+	}
+
+	// Wisp IDs may also appear as depends_on_id in dependencies
+	// (a permanent issue depends on a wisp — unlikely but symmetric).
+	if len(wispIDs) > 0 {
+		if err := countDependentsInTable(ctx, tx, "dependencies", wispIDs, result); err != nil {
+			return nil, err
+		}
+	}
+
+	return result, nil
+}
+
+// countDepsInTable counts both dependencies (issue_id match) and dependents
+// (depends_on_id match) from a single table for the given IDs.
+//
+//nolint:gosec // G201: table is a hardcoded constant, inClause contains only ? placeholders
+func countDepsInTable(ctx context.Context, tx *sql.Tx, table string,
+	issueIDs []string, result map[string]*types.DependencyCounts) error {
 	for start := 0; start < len(issueIDs); start += queryBatchSize {
 		end := start + queryBatchSize
 		if end > len(issueIDs) {
@@ -126,23 +177,22 @@ func GetDependencyCountsInTx(ctx context.Context, tx *sql.Tx, issueIDs []string)
 		}
 		inClause := strings.Join(placeholders, ",")
 
-		// Blockers: issues that block the given IDs
-		//nolint:gosec // G201: inClause contains only ? placeholders
+		// Dependencies: issues that this ID depends on
 		depRows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 			SELECT issue_id, COUNT(*) as cnt
-			FROM dependencies
+			FROM %s
 			WHERE issue_id IN (%s) AND type = 'blocks'
 			GROUP BY issue_id
-		`, inClause), args...)
+		`, table, inClause), args...)
 		if err != nil {
-			return nil, fmt.Errorf("get dependency counts (blockers): %w", err)
+			return fmt.Errorf("count deps in %s (blockers): %w", table, err)
 		}
 		for depRows.Next() {
 			var id string
 			var cnt int
 			if err := depRows.Scan(&id, &cnt); err != nil {
 				_ = depRows.Close()
-				return nil, fmt.Errorf("get dependency counts: scan blocker: %w", err)
+				return fmt.Errorf("count deps in %s: scan blocker: %w", table, err)
 			}
 			if c, ok := result[id]; ok {
 				c.DependencyCount = cnt
@@ -150,26 +200,25 @@ func GetDependencyCountsInTx(ctx context.Context, tx *sql.Tx, issueIDs []string)
 		}
 		_ = depRows.Close()
 		if err := depRows.Err(); err != nil {
-			return nil, fmt.Errorf("get dependency counts: blocker rows: %w", err)
+			return fmt.Errorf("count deps in %s: blocker rows: %w", table, err)
 		}
 
-		// Dependents: issues blocked by the given IDs
-		//nolint:gosec // G201: inClause contains only ? placeholders
+		// Dependents: issues that depend on this ID
 		blockingRows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 			SELECT depends_on_id, COUNT(*) as cnt
-			FROM dependencies
+			FROM %s
 			WHERE depends_on_id IN (%s) AND type = 'blocks'
 			GROUP BY depends_on_id
-		`, inClause), args...)
+		`, table, inClause), args...)
 		if err != nil {
-			return nil, fmt.Errorf("get dependency counts (dependents): %w", err)
+			return fmt.Errorf("count deps in %s (dependents): %w", table, err)
 		}
 		for blockingRows.Next() {
 			var id string
 			var cnt int
 			if err := blockingRows.Scan(&id, &cnt); err != nil {
 				_ = blockingRows.Close()
-				return nil, fmt.Errorf("get dependency counts: scan dependent: %w", err)
+				return fmt.Errorf("count deps in %s: scan dependent: %w", table, err)
 			}
 			if c, ok := result[id]; ok {
 				c.DependentCount = cnt
@@ -177,11 +226,60 @@ func GetDependencyCountsInTx(ctx context.Context, tx *sql.Tx, issueIDs []string)
 		}
 		_ = blockingRows.Close()
 		if err := blockingRows.Err(); err != nil {
-			return nil, fmt.Errorf("get dependency counts: dependent rows: %w", err)
+			return fmt.Errorf("count deps in %s: dependent rows: %w", table, err)
 		}
 	}
+	return nil
+}
 
-	return result, nil
+// countDependentsInTable counts only dependents (depends_on_id match) from a
+// specific table. Used for cross-table lookups where an ID in one table appears
+// as depends_on_id in the other table. Uses += to add to existing counts.
+//
+//nolint:gosec // G201: table is a hardcoded constant, inClause contains only ? placeholders
+func countDependentsInTable(ctx context.Context, tx *sql.Tx, table string,
+	issueIDs []string, result map[string]*types.DependencyCounts) error {
+	for start := 0; start < len(issueIDs); start += queryBatchSize {
+		end := start + queryBatchSize
+		if end > len(issueIDs) {
+			end = len(issueIDs)
+		}
+		batch := issueIDs[start:end]
+
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		inClause := strings.Join(placeholders, ",")
+
+		blockingRows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+			SELECT depends_on_id, COUNT(*) as cnt
+			FROM %s
+			WHERE depends_on_id IN (%s) AND type = 'blocks'
+			GROUP BY depends_on_id
+		`, table, inClause), args...)
+		if err != nil {
+			return fmt.Errorf("count dependents in %s: %w", table, err)
+		}
+		for blockingRows.Next() {
+			var id string
+			var cnt int
+			if err := blockingRows.Scan(&id, &cnt); err != nil {
+				_ = blockingRows.Close()
+				return fmt.Errorf("count dependents in %s: scan: %w", table, err)
+			}
+			if c, ok := result[id]; ok {
+				c.DependentCount += cnt
+			}
+		}
+		_ = blockingRows.Close()
+		if err := blockingRows.Err(); err != nil {
+			return fmt.Errorf("count dependents in %s: rows: %w", table, err)
+		}
+	}
+	return nil
 }
 
 // GetBlockingInfoForIssuesInTx returns blocking dependency records for a set of issue IDs.

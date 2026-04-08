@@ -275,6 +275,77 @@ func TestGetDependencyCounts_EmptyList(t *testing.T) {
 	}
 }
 
+// TestGetDependencyCounts_WispIDs verifies that GetDependencyCounts returns
+// correct counts for wisp (ephemeral) issues whose dependencies are stored in
+// the wisp_dependencies table rather than the regular dependencies table.
+func TestGetDependencyCounts_WispIDs(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Create a permanent issue that the wisp will depend on
+	blocker := &types.Issue{
+		ID:        "test-blocker1",
+		Title:     "Blocker",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, blocker, "tester"); err != nil {
+		t.Fatalf("failed to create blocker: %v", err)
+	}
+
+	// Create a wisp (ephemeral issue) — the store auto-generates a -wisp- ID
+	wisp := &types.Issue{
+		Title:     "MR wisp for test",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	if err := store.CreateIssue(ctx, wisp, "tester"); err != nil {
+		t.Fatalf("failed to create wisp: %v", err)
+	}
+	wispID := wisp.ID
+	if !strings.Contains(wispID, "-wisp-") {
+		t.Fatalf("expected wisp ID to contain '-wisp-', got %q", wispID)
+	}
+
+	// Add a blocks dependency: wisp depends on blocker
+	dep := &types.Dependency{
+		IssueID:     wispID,
+		DependsOnID: blocker.ID,
+		Type:        types.DepBlocks,
+	}
+	if err := store.AddDependency(ctx, dep, "tester"); err != nil {
+		t.Fatalf("failed to add dependency: %v", err)
+	}
+
+	// Verify the dep exists via GetDependencyRecordsForIssues (has wisp routing)
+	records, err := store.GetDependencyRecordsForIssues(ctx, []string{wispID})
+	if err != nil {
+		t.Fatalf("GetDependencyRecordsForIssues failed: %v", err)
+	}
+	if len(records[wispID]) != 1 {
+		t.Fatalf("expected 1 dep record for wisp, got %d", len(records[wispID]))
+	}
+
+	// GetDependencyCounts should also return 1 dep for the wisp
+	counts, err := store.GetDependencyCounts(ctx, []string{wispID, blocker.ID})
+	if err != nil {
+		t.Fatalf("GetDependencyCounts failed: %v", err)
+	}
+
+	if counts[wispID].DependencyCount != 1 {
+		t.Errorf("wisp should have 1 dep, got %d", counts[wispID].DependencyCount)
+	}
+	if counts[blocker.ID].DependentCount != 1 {
+		t.Errorf("blocker should have 1 dependent, got %d", counts[blocker.ID].DependentCount)
+	}
+}
+
 // =============================================================================
 // GetDependencyTree Tests
 // =============================================================================
