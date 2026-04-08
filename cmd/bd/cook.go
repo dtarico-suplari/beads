@@ -477,6 +477,15 @@ func cookFormulaToSubgraph(f *formula.Formula, protoID string) (*TemplateSubgrap
 
 // createGateIssue creates a gate issue for a step with a Gate field.
 // Gate issues have type=gate and block the step they guard.
+// gateDescription returns the description for a gate issue.
+// Script gates get detailed instructions; other gate types get a generic description.
+func gateDescription(step *formula.Step) string {
+	if step.Gate != nil && step.Gate.Type == "script" {
+		return fmt.Sprintf("Script gate for step %s.\n\nThis gate runs a script automatically when you close it. The script can take longer than the max synchronous tool call timeout of 10 minutes.\n\n**How to execute:**\n1. Run `bd close <this-step-id>` in the background using `run_in_background: true`\n2. Wait for completion with repeated `sleep 30` calls until the background task finishes\n3. Read the output — it contains the script results\n\nIf the script passes (exit 0), the gate closes and the next step unblocks. If it fails, read the error output, fix the issue, and retry.\n\nDo NOT run the script command manually — `bd close` handles it.", step.ID)
+	}
+	return fmt.Sprintf("Async gate for step %s", step.ID)
+}
+
 // Returns the gate issue and its ID.
 func createGateIssue(step *formula.Step, parentID string) *types.Issue {
 	if step.Gate == nil {
@@ -504,7 +513,7 @@ func createGateIssue(step *formula.Step, parentID string) *types.Issue {
 	return &types.Issue{
 		ID:          gateID,
 		Title:       title,
-		Description: fmt.Sprintf("Async gate for step %s", step.ID),
+		Description: gateDescription(step),
 		Status:      types.StatusOpen,
 		Priority:    2,
 		IssueType:   "gate",
@@ -654,6 +663,32 @@ func collectSteps(steps []*formula.Step, parentID string,
 				DependsOnID: gateIssue.ID,
 				Type:        types.DepBlocks,
 			})
+
+			// Gate inherits the step's needs so it doesn't become ready
+			// before the step's prerequisites are met. Without this, gates
+			// are immediately ready and polecats execute them out of order.
+			for _, needID := range step.Needs {
+				resolvedNeedID := fmt.Sprintf("%s.%s", parentID, needID)
+				if mapped, ok := idMapping[needID]; ok {
+					resolvedNeedID = mapped
+				}
+				*deps = append(*deps, &types.Dependency{
+					IssueID:     gateIssue.ID,
+					DependsOnID: resolvedNeedID,
+					Type:        types.DepBlocks,
+				})
+			}
+			for _, depID := range step.DependsOn {
+				resolvedDepID := fmt.Sprintf("%s.%s", parentID, depID)
+				if mapped, ok := idMapping[depID]; ok {
+					resolvedDepID = mapped
+				}
+				*deps = append(*deps, &types.Dependency{
+					IssueID:     gateIssue.ID,
+					DependsOnID: resolvedDepID,
+					Type:        types.DepBlocks,
+				})
+			}
 		}
 
 		// Recursively collect children

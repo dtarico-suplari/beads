@@ -117,6 +117,12 @@ the flags appear in the command line.`,
 				}
 			}
 
+			// Script gates are non-bypassable — they run even with --force.
+			if err := checkScriptGate(issue); err != nil {
+				fmt.Fprintf(os.Stderr, "cannot close %s: %s\n", id, err)
+				continue
+			}
+
 			// Check gate satisfaction for machine-checkable gates (GH#1467)
 			if !force {
 				if err := checkGateSatisfaction(issue); err != nil {
@@ -438,6 +444,8 @@ func isMachineCheckableGate(issue *types.Issue) bool {
 		return true
 	case issue.AwaitType == "bead":
 		return true
+	case issue.AwaitType == "script":
+		return true
 	default:
 		return false
 	}
@@ -456,6 +464,10 @@ func checkGateSatisfaction(issue *types.Issue) error {
 	var err error
 
 	switch {
+	case issue.AwaitType == "script":
+		// Script gates are fully handled by checkScriptGate (runs before this).
+		// If we reach here, the script already passed.
+		return nil
 	case strings.HasPrefix(issue.AwaitType, "gh:run"):
 		resolved, escalated, reason, err = checkGHRun(issue, true)
 	case strings.HasPrefix(issue.AwaitType, "gh:pr"):
