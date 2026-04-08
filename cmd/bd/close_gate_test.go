@@ -66,6 +66,14 @@ func TestIsMachineCheckableGate(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "gate with script await type",
+			issue: &types.Issue{
+				IssueType: "gate",
+				AwaitType: "script",
+			},
+			want: true,
+		},
+		{
 			name: "gate with empty await type",
 			issue: &types.Issue{
 				IssueType: "gate",
@@ -199,5 +207,172 @@ func TestCheckGateSatisfaction_ErrorMessageFormat(t *testing.T) {
 	}
 	if !strings.Contains(errMsg, "gate condition not satisfied") {
 		t.Errorf("error message should mention 'gate condition not satisfied', got: %s", errMsg)
+	}
+}
+
+func TestCheckGateSatisfaction_ScriptGatePassesThrough(t *testing.T) {
+	// Script gates are handled by checkScriptGate (which runs first).
+	// checkGateSatisfaction should return nil for script gates since
+	// they've already been validated.
+	issue := &types.Issue{
+		IssueType: "gate",
+		AwaitType: "script",
+		AwaitID:   "audit-acceptance test-issue",
+		Title:     "Script gate",
+	}
+
+	err := checkGateSatisfaction(issue)
+	if err != nil {
+		t.Errorf("checkGateSatisfaction() should return nil for script gate, got: %v", err)
+	}
+}
+
+func TestCheckScript_PassingScript(t *testing.T) {
+	resolved, reason, _ := checkScript("true")
+	if !resolved {
+		t.Errorf("checkScript(true) should resolve, got reason: %s", reason)
+	}
+}
+
+func TestCheckScript_FailingScript(t *testing.T) {
+	resolved, reason, _ := checkScript("false")
+	if resolved {
+		t.Error("checkScript(false) should not resolve")
+	}
+	if reason == "" {
+		t.Error("expected reason to be set for failing script")
+	}
+}
+
+func TestCheckScript_ScriptWithArgs(t *testing.T) {
+	resolved, reason, _ := checkScript("test 1 -eq 1")
+	if !resolved {
+		t.Errorf("checkScript('test 1 -eq 1') should resolve, got reason: %s", reason)
+	}
+}
+
+func TestCheckScript_ScriptWithFailingArgs(t *testing.T) {
+	resolved, reason, _ := checkScript("test 1 -eq 2")
+	if resolved {
+		t.Error("checkScript('test 1 -eq 2') should not resolve")
+	}
+	if !strings.Contains(reason, "exit") {
+		t.Errorf("reason should mention exit status, got: %s", reason)
+	}
+}
+
+func TestCheckScript_EmptyCommand(t *testing.T) {
+	resolved, reason, _ := checkScript("")
+	if resolved {
+		t.Error("checkScript('') should not resolve")
+	}
+	if !strings.Contains(reason, "empty") {
+		t.Errorf("reason should mention empty command, got: %s", reason)
+	}
+}
+
+func TestCheckScript_CapturesStdout(t *testing.T) {
+	resolved, _, stdout := checkScript("echo 'Plan generated at /tmp/plan.md'")
+	if !resolved {
+		t.Error("checkScript(echo) should resolve")
+	}
+	if stdout != "Plan generated at /tmp/plan.md" {
+		t.Errorf("expected stdout to be captured, got: %q", stdout)
+	}
+}
+
+func TestCheckScript_EmptyStdoutOnPass(t *testing.T) {
+	resolved, _, stdout := checkScript("true")
+	if !resolved {
+		t.Error("checkScript(true) should resolve")
+	}
+	if stdout != "" {
+		t.Errorf("expected empty stdout for 'true', got: %q", stdout)
+	}
+}
+
+func TestCheckScript_NoStdoutOnFail(t *testing.T) {
+	resolved, _, stdout := checkScript("echo 'some output' && false")
+	if resolved {
+		t.Error("checkScript should not resolve")
+	}
+	if stdout != "" {
+		t.Errorf("expected empty stdout on failure, got: %q", stdout)
+	}
+}
+
+func TestCheckScript_NonexistentCommand(t *testing.T) {
+	resolved, reason, _ := checkScript("nonexistent-command-xyz-12345") //nolint:dogsled
+	if resolved {
+		t.Error("checkScript with nonexistent command should not resolve")
+	}
+	if reason == "" {
+		t.Error("expected reason for nonexistent command")
+	}
+}
+
+func TestCheckScriptGate_Pass(t *testing.T) {
+	issue := &types.Issue{
+		IssueType: "gate",
+		AwaitType: "script",
+		AwaitID:   "true",
+		Title:     "Script gate that passes",
+	}
+
+	err := checkScriptGate(issue)
+	if err != nil {
+		t.Errorf("checkScriptGate() should pass for script gate with 'true': %v", err)
+	}
+}
+
+func TestCheckScriptGate_NonGateIssue(t *testing.T) {
+	issue := &types.Issue{
+		IssueType: "task",
+		Title:     "Regular task",
+	}
+
+	err := checkScriptGate(issue)
+	if err != nil {
+		t.Errorf("checkScriptGate() should return nil for non-gate issue: %v", err)
+	}
+}
+
+func TestCheckScriptGate_NilIssue(t *testing.T) {
+	err := checkScriptGate(nil)
+	if err != nil {
+		t.Errorf("checkScriptGate() should return nil for nil issue: %v", err)
+	}
+}
+
+func TestCheckGateSatisfaction_ScriptGateFail(t *testing.T) {
+	// Script gates use checkScriptGate (non-bypassable), not checkGateSatisfaction.
+	// checkGateSatisfaction returns nil for script gates (they're handled separately).
+	issue := &types.Issue{
+		IssueType: "gate",
+		AwaitType: "script",
+		AwaitID:   "false",
+		Title:     "Script gate that fails",
+	}
+
+	err := checkScriptGate(issue)
+	if err == nil {
+		t.Error("checkScriptGate() should return error for script gate with 'false'")
+	}
+	if err != nil && !strings.Contains(err.Error(), "cannot be overridden") {
+		t.Errorf("error should mention 'cannot be overridden', got: %v", err)
+	}
+}
+
+func TestCheckScriptGate_EmptyAwaitID(t *testing.T) {
+	issue := &types.Issue{
+		IssueType: "gate",
+		AwaitType: "script",
+		AwaitID:   "",
+		Title:     "Script gate without command",
+	}
+
+	err := checkScriptGate(issue)
+	if err == nil {
+		t.Error("checkScriptGate() should return error for script gate without await_id")
 	}
 }

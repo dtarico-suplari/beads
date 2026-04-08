@@ -31,6 +31,7 @@ Gate types:
   gh:run  - Waits for GitHub workflow (Phase 3)
   gh:pr   - Waits for PR merge (Phase 3)
   bead    - Waits for cross-rig bead to close (Phase 4)
+  script  - Runs shell command, checks exit 0
 
 For bead gates, await_id format is <rig>:<bead-id> (e.g., "other-project:op-abc123").
 
@@ -338,6 +339,7 @@ Gate types:
   gh:pr    - Check pull request merge status
   timer    - Check timer gates (auto-expire based on timeout)
   bead     - Check cross-rig bead gates
+  script   - Check script gates (run command, check exit 0)
   all      - Check all gate types
 
 GitHub gates use the 'gh' CLI to query status:
@@ -349,6 +351,7 @@ A gate is resolved when:
   - gh:pr: state=MERGED
   - timer: current time > created_at + timeout
   - bead: target bead status=closed
+  - script: command exits 0
 
 A gate is escalated when:
   - gh:run: status=completed AND conclusion in (failure, canceled)
@@ -359,7 +362,8 @@ Examples:
   bd gate check --type=gh    # Check only GitHub gates
   bd gate check --type=gh:run # Check only workflow run gates
   bd gate check --type=timer # Check only timer gates
-  bd gate check --type=bead  # Check only cross-rig bead gates
+  bd gate check --type=bead   # Check only cross-rig bead gates
+  bd gate check --type=script # Check only script gates
   bd gate check --dry-run    # Show what would happen without changes
   bd gate check --escalate   # Escalate expired/failed gates`,
 	Run: func(cmd *cobra.Command, args []string) {
@@ -428,6 +432,8 @@ Examples:
 				result.resolved, result.escalated, result.reason, result.err = checkTimer(gate, now)
 			case gate.AwaitType == "bead":
 				result.resolved, result.reason = checkBeadGate(ctx, gate.AwaitID)
+			case gate.AwaitType == "script":
+				result.resolved, result.reason, _ = checkScript(gate.AwaitID)
 			default:
 				// Skip unsupported gate types (human gates need manual resolution)
 				continue
@@ -731,6 +737,48 @@ func checkTimer(gate *types.Issue, now time.Time) (resolved, escalated bool, rea
 // This always returns false with a descriptive message.
 func checkBeadGate(_ context.Context, awaitID string) (bool, string) {
 	return false, fmt.Sprintf("cross-rig bead gate %q cannot be checked (multi-rig routing removed)", awaitID)
+}
+
+// checkScriptGate checks if a gate issue has a script gate condition.
+// Script gates are non-bypassable — --force does not skip them.
+// Returns nil if the issue is not a script gate or if the script passes.
+func checkScriptGate(issue *types.Issue) error {
+	if issue == nil || issue.IssueType != "gate" || issue.AwaitType != "script" {
+		return nil
+	}
+	resolved, reason, stdout := checkScript(issue.AwaitID)
+	if resolved {
+		if stdout != "" {
+			fmt.Println(stdout)
+		}
+		return nil
+	}
+	return fmt.Errorf("script gate not satisfied: %s (cannot be overridden)", reason)
+}
+
+// checkScript runs a shell command and returns whether it exited 0.
+// On success, stdout is captured and returned so callers can surface script
+// output (e.g., plan file contents) to the agent's context.
+// The command string from await_id is split and executed via sh -c.
+func checkScript(command string) (resolved bool, reason string, stdout string) {
+	if command == "" {
+		return false, "empty script command", ""
+	}
+
+	cmd := exec.Command("sh", "-c", command) // #nosec G204 -- command comes from formula gate definition, not user input
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Run(); err != nil {
+		stderrStr := strings.TrimSpace(stderrBuf.String())
+		if stderrStr != "" {
+			return false, fmt.Sprintf("script failed (exit %v): %s", err, stderrStr), ""
+		}
+		return false, fmt.Sprintf("script failed (exit %v)", err), ""
+	}
+
+	return true, "script passed", strings.TrimSpace(stdoutBuf.String())
 }
 
 // closeGate closes a gate issue with the given reason

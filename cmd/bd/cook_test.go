@@ -502,6 +502,62 @@ func TestCookFormulaToSubgraph_GateParentChild(t *testing.T) {
 	}
 }
 
+// TestCookFormulaToSubgraph_GateInheritsStepNeeds tests that a gate inherits
+// the step's needs dependencies so it doesn't become ready prematurely.
+func TestCookFormulaToSubgraph_GateInheritsStepNeeds(t *testing.T) {
+	f := &formula.Formula{
+		Formula:     "mol-gate-needs",
+		Description: "Test gate inherits step needs",
+		Version:     1,
+		Type:        formula.TypeWorkflow,
+		Steps: []*formula.Step{
+			{
+				ID:    "preflight",
+				Title: "Run preflights",
+			},
+			{
+				ID:    "plan",
+				Title: "Generate plan",
+				Needs: []string{"preflight"},
+				Gate: &formula.Gate{
+					Type: "script",
+					ID:   "generate-plan test-issue",
+				},
+			},
+			{
+				ID:    "implement",
+				Title: "Implement",
+				Needs: []string{"plan"},
+			},
+		},
+	}
+
+	subgraph, err := cookFormulaToSubgraph(f, "mol-gate-needs")
+	if err != nil {
+		t.Fatalf("cookFormulaToSubgraph failed: %v", err)
+	}
+
+	gateID := "mol-gate-needs.gate-plan"
+	preflightID := "mol-gate-needs.preflight"
+
+	// Gate should depend on preflight (inherited from plan step's needs)
+	var foundGateNeedsDep bool
+	for _, dep := range subgraph.Dependencies {
+		if dep.IssueID == gateID && dep.DependsOnID == preflightID {
+			foundGateNeedsDep = true
+			break
+		}
+	}
+
+	if !foundGateNeedsDep {
+		t.Error("Gate should inherit step's needs — expected dependency gate -> preflight")
+		t.Log("Dependencies found:")
+		for _, dep := range subgraph.Dependencies {
+			t.Logf("  %s -> %s (%s)", dep.IssueID, dep.DependsOnID, dep.Type)
+		}
+	}
+}
+
 // =============================================================================
 // Standalone Expansion Tests (bd-qzb)
 // =============================================================================
