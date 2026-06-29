@@ -434,6 +434,23 @@ func resolveCommandBeadsDir(dbPath string) string {
 		return ""
 	}
 
+	// When BEADS_DIR is explicitly set it is the authoritative workspace
+	// selector. A shared absolute BEADS_DOLT_DATA_DIR makes DatabasePath()
+	// collapse to the same path for every rig, which would otherwise let the
+	// data-path match below resolve to the wrong (town) .beads and bind the
+	// global store to the wrong dolt_database — so `bd mol wisp/bond` and
+	// `bd list` operate on the town/hq database instead of the rig's. Honor
+	// an explicit, valid BEADS_DIR first. (`bd show` masked this via prefix
+	// routing; mol/list have no such fallback.)
+	if envDir := os.Getenv("BEADS_DIR"); envDir != "" {
+		resolved := beads.FollowRedirect(utils.CanonicalizePath(envDir))
+		if info, err := os.Stat(resolved); err == nil && info.IsDir() {
+			if _, err := os.Stat(filepath.Join(resolved, "metadata.json")); err == nil {
+				return resolved
+			}
+		}
+	}
+
 	// Use the same validated candidate logic as the helper/reopen path
 	// (GH#2627). This checks filepath.Dir, canonicalized paths, AND
 	// FindBeadsDir — but only returns a candidate whose metadata.json
